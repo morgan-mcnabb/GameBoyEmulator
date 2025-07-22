@@ -11,7 +11,7 @@ public class ReadOnlyMemoryRegionTests
 
     private readonly ReadOnlyMemoryRegion _rom;
 
-    public ReadOnlyMemoryRegionTests() => _rom = new(BiosAddr, _bios);
+    public ReadOnlyMemoryRegionTests() => _rom = new ReadOnlyMemoryRegion(BiosAddr, _bios);
 
     [Fact]
     public void Handles_matches_span()
@@ -30,7 +30,7 @@ public class ReadOnlyMemoryRegionTests
     [Fact]
     public void Write8_throws_InvalidOperationException()
     {
-        Action act = () => _rom.Write8(BiosAddr, 0xFF);
+        var act = () => _rom.Write8(BiosAddr, 0xFF);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*read-only*");
     }
