@@ -1,4 +1,5 @@
 using Core.Abstract;
+using Core.Cpu.Decoding;
 
 namespace Core.Cpu;
 
@@ -30,75 +31,104 @@ public sealed class Arm7TdmiCpu : ICpu
     
     /// <inheritdoc />
     public uint Pc => _registers[PcIndex];
+
+    private void AdvancePc() => _registers[PcIndex] += 4;
     
     /// <inheritdoc />
     public void Step()
     {
         // fetch
         var opcode = _bus.Read32(Pc & ~3u);
+
+        var condition = (ConditionCode)(opcode >> 28);
+        if (!ConditionMet(condition))
+        {
+            AdvancePc();
+            return; // no-op
+        }
         
         // decode 
         // TODO: insert decode table & execution pipeline
-        
-        // increment PC
-        _registers[PcIndex] += 4; // advance to next ARM instruction
+        if (ArmInstructionDecoder.TryDecodeDataProcessing(opcode, out var decodedInstruction))
+            ExecuteDataProcessing(decodedInstruction);
+        else
+            throw new NotImplementedException(
+                $"Opcode group not yet implemented (0x{opcode:X8})");
+
+        AdvancePc();
     }
 
-
-    /// <summary>
-    /// *Program Status Register* (CPSR on real hardware).
-    ///
-    /// The real CPSR is a 32-bit word whose bits are packed like this:
-    /// 31   30   29   28        7   6   5     0
-    ///  N | Z | C | V | … | I | F | T |  MODE  |
-    ///
-    /// * **N, Z, C, V** – ALU condition flags (Negative, Zero, Carry, Overflow)  
-    /// * **I** – IRQ disable  
-    /// * **F** – FIQ disable  
-    /// * **T** – Execution state (0 = ARM, 1 = Thumb) 
-    /// </summary>
-    private struct ProgramStatusRegister
+    private void ExecuteDataProcessing(DecodedDataProcessingInstruction instruction)
     {
-        // Condition-code flags
-        public bool Negative;   // Bit 31
-        public bool Zero;       // Bit 30
-        public bool Carry;      // Bit 29
-        public bool Overflow;   // Bit 28
+        var operand1Value = _registers[instruction.RegisterN];
+        var operand2Value = ArmInstructionDecoder.ExpandOperand2(instruction, _registers,
+            _currentProgramStatusRegister.Carry, out var shifterCarryFlag);
 
-        // Interrupt / state flags
-        public bool IrqDisable; // Bit 7
-        public bool FiqDisable; // Bit 6
-        public bool ThumbState; // Bit 5
+        uint result;
+        var carryOutFlag = false;
+        var overflowOutFlag = false;
 
-        /// <summary>
-        /// Packs the human-readable flag fields into a raw 32-bit value.
-        /// Getting the property *assembles* the word; setting it *decomposes*
-        /// the word back into individual Booleans. 
-        /// </summary>
-        public uint Value
+        switch (instruction.Opcode)
         {
-            get
-            {
-                uint word = 0;
-                if (Negative)   word |= 1u << 31;
-                if (Zero)       word |= 1u << 30;
-                if (Carry)      word |= 1u << 29;
-                if (Overflow)   word |= 1u << 28;
-                if (IrqDisable) word |= 1u << 7;
-                if (FiqDisable) word |= 1u << 6;
-                if (ThumbState) word |= 1u << 5;
-                return word;
-            }
-            set
-            {
-                Negative   = (value & (1u << 31)) != 0;
-                Zero       = (value & (1u << 30)) != 0;
-                Carry      = (value & (1u << 29)) != 0;
-                Overflow   = (value & (1u << 28)) != 0;
-                IrqDisable = (value & (1u << 7))  != 0;
-                FiqDisable = (value & (1u << 6))  != 0;
-                ThumbState = (value & (1u << 5))  != 0;
-            }
+            case DataProcessingOpcode.Mov:
+                result        = operand2Value;
+                carryOutFlag  = shifterCarryFlag;
+                overflowOutFlag = _currentProgramStatusRegister.Overflow;
+                break;
+
+            case DataProcessingOpcode.Add:
+                (result, carryOutFlag, overflowOutFlag) =
+                    AddWithCarry(operand1Value, operand2Value, carryInFlag: false);
+                break;
+
+            case DataProcessingOpcode.Sub:
+                (result, carryOutFlag, overflowOutFlag) =
+                    AddWithCarry(operand1Value, ~operand2Value, carryInFlag: true);
+                break;
+
+            default:
+                throw new NotImplementedException($"Opcode {instruction.Opcode} not yet supported.");
         }
+
+        _registers[instruction.RegisterD] = result;
+        
+        if (instruction.SetConditionCodes)
+            AluFlagHelper.UpdateNegativeZeroCarryOverflow(ref _currentProgramStatusRegister, result, carryOutFlag, overflowOutFlag);
+    }
+
+    private static (uint Result, bool Carry, bool Overflow) AddWithCarry(
+        uint leftOperand, uint rightOperand, bool carryInFlag)
+    {
+        var unsignedSum = (ulong)leftOperand + rightOperand + (carryInFlag ? 1UL : 0UL);
+        var signedSum = (long)(int)leftOperand + (int)rightOperand + (carryInFlag ? 1L : 0L);
+
+        var result = (uint)unsignedSum;
+        var carryOut = (unsignedSum >> 32) != 0;
+        var overflowOut = signedSum is < int.MinValue or > int.MaxValue;
+
+        return (result, carryOut, overflowOut);
+    }
+    
+    private bool ConditionMet(ConditionCode condition)
+    {
+        var psr = _currentProgramStatusRegister;
+        return condition switch
+        {
+            ConditionCode.Equal                 => psr.Zero,
+            ConditionCode.NotEqual              => !psr.Zero,
+            ConditionCode.CarrySet              => psr.Carry,
+            ConditionCode.CarryClear            => !psr.Carry,
+            ConditionCode.Minus                 => psr.Negative,
+            ConditionCode.Plus                  => !psr.Negative,
+            ConditionCode.OverflowSet           => psr.Overflow,
+            ConditionCode.OverflowClear         => !psr.Overflow,
+            ConditionCode.UnsignedHigher        => psr.Carry && !psr.Zero,
+            ConditionCode.UnsignedLowerOrSame   => !psr.Carry || psr.Zero,
+            ConditionCode.SignedGreaterOrEqual  => psr.Negative == psr.Overflow,
+            ConditionCode.SignedLess            => psr.Negative != psr.Overflow,
+            ConditionCode.SignedGreater         => !psr.Zero && psr.Negative == psr.Overflow,
+            ConditionCode.SignedLessOrEqual     => psr.Zero || psr.Negative != psr.Overflow,
+            _                                   => true // ConditionCode.Always
+        };
     }
 }
