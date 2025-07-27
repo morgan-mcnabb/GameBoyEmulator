@@ -20,6 +20,12 @@ public static class ArmInstructionDecoder
             decoded = default;
             return false;
         }
+        
+        if (((rawInstruction >> 4) & 0xF) == 0x9)
+        {
+            decoded = default;
+            return false;
+        }
 
         var opcode = (DataProcessingOpcode)((rawInstruction >> 21) & 0xF);
         var usesImmediate = (rawInstruction & (1u << 25)) != 0;

@@ -1,3 +1,4 @@
+using System.Security.AccessControl;
 using Core.Abstract;
 using Core.Cpu.Decoding;
 
@@ -12,6 +13,9 @@ public sealed class Arm7TdmiCpu : ICpu
     private readonly IMemoryBus _bus;
     private readonly uint[] _registers = new uint[RegisterCount];
     private ProgramStatusRegister _currentProgramStatusRegister;
+
+    private uint ReadRegisterWithPcOffset(int index) 
+        => index == PcIndex ? _registers[PcIndex] + 8u : _registers[index];
 
     public Arm7TdmiCpu(IMemoryBus bus)
     {
@@ -46,11 +50,12 @@ public sealed class Arm7TdmiCpu : ICpu
             AdvancePc();
             return; // no-op
         }
-        
+
+        var pcWasWritten = false;
         // decode 
         // TODO: insert decode table & execution pipeline
         if (ArmInstructionDecoder.TryDecodeDataProcessing(opcode, out var decodedInstruction))
-            ExecuteDataProcessing(decodedInstruction);
+            pcWasWritten = ExecuteDataProcessing(decodedInstruction);
         else
             throw new NotImplementedException(
                 $"Opcode group not yet implemented (0x{opcode:X8})");
@@ -58,55 +63,122 @@ public sealed class Arm7TdmiCpu : ICpu
         AdvancePc();
     }
 
-    private void ExecuteDataProcessing(DecodedDataProcessingInstruction instruction)
+    private bool ExecuteDataProcessing(DecodedDataProcessingInstruction instruction)
     {
-        var operand1Value = _registers[instruction.RegisterN];
-        var operand2Value = ArmInstructionDecoder.ExpandOperand2(instruction, _registers,
+        var operand1Value = ReadRegisterWithPcOffset(instruction.RegisterN);
+
+        Span<uint> registersForOp2 = stackalloc uint[RegisterCount];
+        _registers.AsSpan().CopyTo(registersForOp2);
+        registersForOp2[PcIndex] = _registers[PcIndex] + 8u;
+
+        var operand2Value = ArmInstructionDecoder.ExpandOperand2(instruction, registersForOp2,
             _currentProgramStatusRegister.Carry, out var shifterCarryFlag);
 
-        uint result;
-        var carryOutFlag = false;
-        var overflowOutFlag = false;
+        uint  result = 0;
+        var  carryOut = shifterCarryFlag;            // logical ops default
+        var  overflowOut = _currentProgramStatusRegister.Overflow;          // logical ops leave V
+        var  writeBackToRd = true;
+        var  updateCondition = instruction.SetConditionCodes;
+        var pcWritten = false;
+
 
         switch (instruction.Opcode)
         {
+            case DataProcessingOpcode.And:
+                result = operand1Value & operand2Value;
+                break;
+            
+            case DataProcessingOpcode.Eor:
+                result = operand1Value ^ operand2Value;
+                break;
+            
+            case DataProcessingOpcode.Orr:
+                result = operand1Value | operand2Value;
+                break;
+            
+            case DataProcessingOpcode.Bic:
+                result = operand1Value & ~operand2Value;
+                break;
+            
             case DataProcessingOpcode.Mov:
-                result        = operand2Value;
-                carryOutFlag  = shifterCarryFlag;
-                overflowOutFlag = _currentProgramStatusRegister.Overflow;
+                result = operand2Value;
                 break;
-
+           
+            case DataProcessingOpcode.Mvn:
+                result = ~operand2Value;
+                break;
+            
             case DataProcessingOpcode.Add:
-                (result, carryOutFlag, overflowOutFlag) =
-                    AddWithCarry(operand1Value, operand2Value, carryInFlag: false);
+                (result, carryOut, overflowOut) =
+                    AluOperations.AddWithCarry(operand1Value, operand2Value, carryInFlag: false);
                 break;
-
+            
+            case DataProcessingOpcode.Adc:
+                (result, carryOut, overflowOut) =
+                    AluOperations.AddWithCarry(operand1Value, operand2Value, _currentProgramStatusRegister.Carry);
+                break;
+            
             case DataProcessingOpcode.Sub:
-                (result, carryOutFlag, overflowOutFlag) =
-                    AddWithCarry(operand1Value, ~operand2Value, carryInFlag: true);
+                (result, carryOut, overflowOut) =
+                    AluOperations.AddWithCarry(operand1Value, ~operand2Value, carryInFlag: true);
+                break;
+            
+            case DataProcessingOpcode.Sbc:
+                (result, carryOut, overflowOut) =
+                    AluOperations.AddWithCarry(operand1Value, ~operand2Value, _currentProgramStatusRegister.Carry);
+                break;
+            
+            case DataProcessingOpcode.Rsb:
+                (result, carryOut, overflowOut) =
+                    AluOperations.AddWithCarry(operand2Value, ~operand1Value, carryInFlag: true);
+                break;
+            
+            case DataProcessingOpcode.Rsc:
+                (result, carryOut, overflowOut) =
+                    AluOperations.AddWithCarry(operand2Value, ~operand1Value, _currentProgramStatusRegister.Carry);
+                break;
+            
+            case DataProcessingOpcode.Tst:     
+                result          = operand1Value & operand2Value;
+                writeBackToRd   = false;
+                updateCondition = true;       
                 break;
 
+            case DataProcessingOpcode.Teq:    
+                result          = operand1Value ^ operand2Value;
+                writeBackToRd   = false;
+                updateCondition = true;
+                break;
+
+            case DataProcessingOpcode.Cmp: 
+                (result, carryOut, overflowOut) =
+                    AluOperations.AddWithCarry(operand1Value, ~operand2Value,
+                        carryInFlag: true);
+                writeBackToRd   = false;
+                updateCondition = true;
+                break;
+
+            case DataProcessingOpcode.Cmn:    
+                (result, carryOut, overflowOut) =
+                    AluOperations.AddWithCarry(operand1Value, operand2Value,
+                        carryInFlag: false);
+                writeBackToRd   = false;
+                updateCondition = true;
+                break;
             default:
                 throw new NotImplementedException($"Opcode {instruction.Opcode} not yet supported.");
         }
 
-        _registers[instruction.RegisterD] = result;
-        
-        if (instruction.SetConditionCodes)
-            AluFlagHelper.UpdateNegativeZeroCarryOverflow(ref _currentProgramStatusRegister, result, carryOutFlag, overflowOutFlag);
-    }
+        if (writeBackToRd)
+        {
+            _registers[instruction.RegisterD] = result;
+            pcWritten = instruction.RegisterD == PcIndex;
+        }
 
-    private static (uint Result, bool Carry, bool Overflow) AddWithCarry(
-        uint leftOperand, uint rightOperand, bool carryInFlag)
-    {
-        var unsignedSum = (ulong)leftOperand + rightOperand + (carryInFlag ? 1UL : 0UL);
-        var signedSum = (long)(int)leftOperand + (int)rightOperand + (carryInFlag ? 1L : 0L);
+        if (updateCondition)
+            AluOperations.UpdateNegativeZeroCarryOverflow(ref _currentProgramStatusRegister, result, carryOut, overflowOut );
 
-        var result = (uint)unsignedSum;
-        var carryOut = (unsignedSum >> 32) != 0;
-        var overflowOut = signedSum is < int.MinValue or > int.MaxValue;
-
-        return (result, carryOut, overflowOut);
+        return pcWritten;
     }
     
     private bool ConditionMet(ConditionCode condition)

@@ -36,15 +36,22 @@ public abstract class MemoryRegionBase : IMemoryRegion
         _buffer[offset] = (byte)(value & 0xFF);
         _buffer[offset + 1] = (byte)((value >> 8) & 0xFF);
     }
-    
-    protected uint Load32Aligned(int offset) =>    
-        (uint) (_buffer[offset] | 
+
+    protected uint Load32Aligned(int offset)
+    {
+        if ((uint)offset > _buffer.Length - 4)
+            throw new IndexOutOfRangeException("32-but read straddles region boundary");
+        
+       return (uint)(_buffer[offset] |
                (_buffer[offset + 1] << 8) |
-               (_buffer[offset + 2] << 16) | 
+               (_buffer[offset + 2] << 16) |
                (_buffer[offset + 3] << 24));
+    }
 
     protected void Store32Aligned(int offset, uint value)
     {
+        if ((uint)offset > _buffer.Length - 4)
+            throw new IndexOutOfRangeException("32-but read straddles region boundary"); 
         _buffer[offset] = (byte)(value & 0xFF);
         _buffer[offset + 1] = (byte)((value >> 8) & 0xFF);
         _buffer[offset + 2] = (byte)((value >> 16) & 0xFF);
