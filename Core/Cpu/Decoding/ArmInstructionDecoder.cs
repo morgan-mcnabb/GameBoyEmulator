@@ -12,6 +12,8 @@ public static class ArmInstructionDecoder
     private const uint BranchTag = 0x0A00_0000u;
     private const uint SingleDataTransferMask = 0x0C00_0000u;
     private const uint SingleDataTransferTag = 0x0400_0000u;
+    private const uint BlockTransferMask = 0x0E00_0000u;
+    private const uint BlockTransferTag = 0x0800_0000u;
 
     /// <summary>
     /// attempts to parse <paramref name="rawInstruction"/> as a data-processing opcode.
@@ -108,6 +110,34 @@ public static class ArmInstructionDecoder
 
         decoded = new DecodedSingleDataTransferInstruction(load, byteTransfer, preIndexing, addOffset, writeBack,
             usesRegisterOffset, baseRegister, sourceDestinationRegister, offsetField);
+        return true;
+    }
+
+    public static bool TryDecodeBlockDataTransfer(uint rawInstruction, out DecodedBlockDataTransferInstruction decoded)
+    {
+        if ((rawInstruction & BlockTransferMask) != BlockTransferTag)
+        {
+            decoded = default;
+            return false;
+        }
+
+        var preIndexing = (rawInstruction & (1u << 24)) != 0;
+        var addOffset = (rawInstruction & (1u << 23)) != 0;
+        var psrsUserMode = (rawInstruction & (1u << 22)) != 0;
+        var writeBack= (rawInstruction & (1u << 21)) != 0;
+        var load= (rawInstruction & (1u << 20)) != 0;
+        var baseRegister = (int)((rawInstruction >> 16) & 0xF);
+        var registerList = (ushort)(rawInstruction & 0xFFFF);
+
+        decoded = new DecodedBlockDataTransferInstruction(
+            load,
+            preIndexing,
+            addOffset,
+            writeBack,
+            psrsUserMode,
+            baseRegister,
+            registerList);
+
         return true;
     }
     

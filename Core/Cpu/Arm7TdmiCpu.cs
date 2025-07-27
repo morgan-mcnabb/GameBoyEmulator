@@ -5,7 +5,7 @@ using static System.Numerics.BitOperations;
 
 namespace Core.Cpu;
 
-public sealed class Arm7TdmiCpu : ICpu
+public sealed partial class Arm7TdmiCpu : ICpu
 {
     private const int RegisterCount = 16; // R0-R15
     private const int PcIndex = 15; // R15 alias
@@ -59,6 +59,8 @@ public sealed class Arm7TdmiCpu : ICpu
             pcWasWritten = ExecuteBranch(branch);
         else if (ArmInstructionDecoder.TryDecodeMultiply(opcode, out var multiplyInstruction))
             pcWasWritten = ExecuteMultiple(multiplyInstruction);
+        else if (ArmInstructionDecoder.TryDecodeBlockDataTransfer(opcode, out var blockDataTransferInstruction))
+            pcWasWritten = ExecuteBlockDataTransfer(blockDataTransferInstruction);
         else if (ArmInstructionDecoder.TryDecodeSingleDataTransfer(opcode, out var dataTransferInstruction))
             pcWasWritten = ExecuteSingleDataTransfer(dataTransferInstruction);
         else if (ArmInstructionDecoder.TryDecodeDataProcessing(opcode, out var decodedInstruction))
@@ -306,6 +308,79 @@ public sealed class Arm7TdmiCpu : ICpu
         pcWasWritten |= instruction.BaseRegister == PcIndex;
 
         return pcWasWritten;
+    }
+    
+    private bool ExecuteBlockDataTransfer(DecodedBlockDataTransferInstruction instruction)
+    {
+        // Snapshot of Rn before any side-effects (needed for self-stores / write-back).
+        var baseRegisterInitialValue = ReadRegisterWithPcOffset(instruction.BaseRegister);
+
+        // Determine whether addresses grow (+4) or shrink (-4).
+        var addressDelta = instruction.AddOffset ? 4u : unchecked((uint)-4);
+
+        // For pre-indexed mode we adjust the address before the first transfer.
+        var currentAddress = instruction.PreIndexing
+            ? baseRegisterInitialValue + addressDelta
+            : baseRegisterInitialValue;
+
+        // Empty register list = transfer PC only (defined by ARM ARM).
+        var registerList = instruction.RegisterList == 0
+            ? (ushort)(1u << PcIndex)
+            : instruction.RegisterList;
+
+        var totalRegisterCount = PopCount(registerList);
+        var programCounterWasWritten = false;
+
+        // Iterate in ascending register order (R0 → R15).  Memory address
+        // naturally moves according to addressDelta, matching ARM behaviour in
+        // all four addressing modes (IA/IB/DA/DB).
+        for (var registerIndex = 0; registerIndex < RegisterCount; registerIndex++)
+        {
+            if ((registerList & (1 << registerIndex)) == 0)
+                continue;
+
+            if (instruction.Load) // ──────── LDM ────────
+            {
+                var loadedValue = _bus.Read32(currentAddress);
+
+                if (registerIndex == PcIndex)
+                {
+                    // Align to word and flush pipeline by setting PC directly.
+                    _registers[PcIndex] = loadedValue & ~1u;
+                    programCounterWasWritten = true;
+                }
+                else
+                {
+                    _registers[registerIndex] = loadedValue;
+                }
+            }
+            else // ──────── STM ────────
+            {
+                var valueToStore = registerIndex == PcIndex
+                    ? _registers[PcIndex] + 12u // PC is 8 ahead + 4 pipeline bubble
+                    : _registers[registerIndex];
+
+                _bus.Write32(currentAddress, valueToStore);
+            }
+
+            currentAddress += addressDelta;
+        }
+
+        // ─── Write-back (if W-bit set) ─────────────────────────────────────
+        if (instruction.WriteBack)
+        {
+            var finalBaseValue = instruction.AddOffset
+                ? baseRegisterInitialValue + 4u * (uint)totalRegisterCount
+                : baseRegisterInitialValue - 4u * (uint)totalRegisterCount;
+
+            _registers[instruction.BaseRegister] = finalBaseValue;
+            if (instruction.BaseRegister == PcIndex)
+                programCounterWasWritten = true;
+        }
+
+        // S-bit (PSR / user-mode) is ignored for now – no mode switching yet.
+
+        return programCounterWasWritten;
     }
     
     private bool ConditionMet(ConditionCode condition)
