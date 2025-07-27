@@ -1,6 +1,7 @@
 using System.Security.AccessControl;
 using Core.Abstract;
 using Core.Cpu.Decoding;
+using static System.Numerics.BitOperations;
 
 namespace Core.Cpu;
 
@@ -54,18 +55,20 @@ public sealed class Arm7TdmiCpu : ICpu
         var pcWasWritten = false;
         // decode 
         // TODO: insert decode table & execution pipeline
-        if (ArmInstructionDecoder.TryDecodeMultiply(opcode, out var multiplyInstruction))
+        if (ArmInstructionDecoder.TryDecodeBranch(opcode, out var branch))
+            pcWasWritten = ExecuteBranch(branch);
+        else if (ArmInstructionDecoder.TryDecodeMultiply(opcode, out var multiplyInstruction))
             pcWasWritten = ExecuteMultiple(multiplyInstruction);
+        else if (ArmInstructionDecoder.TryDecodeSingleDataTransfer(opcode, out var dataTransferInstruction))
+            pcWasWritten = ExecuteSingleDataTransfer(dataTransferInstruction);
         else if (ArmInstructionDecoder.TryDecodeDataProcessing(opcode, out var decodedInstruction))
             pcWasWritten = ExecuteDataProcessing(decodedInstruction);
         else
             throw new NotImplementedException(
                 $"Opcode group not yet implemented (0x{opcode:X8})");
 
-        if (pcWasWritten)
-            return;
-        
-        AdvancePc();
+        if (!pcWasWritten)
+            AdvancePc();
     }
 
     private bool ExecuteDataProcessing(DecodedDataProcessingInstruction instruction)
@@ -206,6 +209,103 @@ public sealed class Arm7TdmiCpu : ICpu
             AluOperations.UpdateNegativeZero(ref _currentProgramStatusRegister, result);
 
         return pcWritten;
+    }
+
+    private bool ExecuteBranch(DecodedBranchInstruction instruction)
+    {
+        // pipeline is ahead by 8 bytes
+        var programVisiblePc = _registers[PcIndex] + 8u;
+        var targetAddress = unchecked(programVisiblePc + (uint)instruction.SignedOffset);
+
+        if (instruction.Link)
+            _registers[14] = _registers[PcIndex] + 4u;
+
+        _registers[PcIndex] = targetAddress;
+        return true;
+
+    }
+
+    private bool ExecuteSingleDataTransfer(DecodedSingleDataTransferInstruction instruction)
+    {
+        var baseValue = ReadRegisterWithPcOffset(instruction.BaseRegister);
+
+        uint offsetValue;
+        if (instruction.UsesRegisterOffset)
+        {
+            var registersSnapshot = _registers.AsSpan();
+            Span<uint> registersWithPc = stackalloc uint[RegisterCount];
+            registersSnapshot.CopyTo(registersWithPc);
+            registersWithPc[PcIndex] = _registers[PcIndex] + 8u;
+
+            var fakeOp = new DecodedDataProcessingInstruction(Opcode: 0, UsesImmediate: false, SetConditionCodes: false,
+                RegisterN: 0, RegisterD: 0, Operand2Raw: instruction.OffsetField);
+            offsetValue =
+                ArmInstructionDecoder.ExpandOperand2(fakeOp, registersWithPc, _currentProgramStatusRegister.Carry,
+                    out _);
+        }
+        else
+            offsetValue = instruction.OffsetField;
+
+        uint effectiveAddress;
+        if (instruction.PreIndexing)
+        {
+            effectiveAddress = instruction.AddOffset
+                ? baseValue + offsetValue
+                : baseValue - offsetValue;
+        }
+        else
+            effectiveAddress = baseValue;
+
+        var pcWasWritten = false;
+
+        if (instruction.Load)
+        {
+            uint loadedValue;
+            if (instruction.ByteTransfer)
+                loadedValue = _bus.Read8(effectiveAddress);
+            else
+            {
+                // for the unaligned word LDR, ARM rotates the aligned word right by 8 * (address & 3)
+                var alignedAddress = effectiveAddress & ~3u;
+                var rawWord = _bus.Read32(alignedAddress);
+                var rotateAmount = (int)((effectiveAddress & 3u) * 8);
+                loadedValue = RotateRight(rawWord, rotateAmount);
+            }
+
+            _registers[instruction.SourceDestRegister] = loadedValue;
+            pcWasWritten = instruction.SourceDestRegister == PcIndex;
+        }
+        else //store
+        {
+            // when the destination registers == program counter, the stored value is PC+12 
+            // according to ARM documentation?
+            var rawStoreValue = instruction.SourceDestRegister == PcIndex
+                ? _registers[PcIndex] + 12u
+                : _registers[instruction.SourceDestRegister];
+            
+            if (instruction.ByteTransfer)
+                _bus.Write8(effectiveAddress, (byte)rawStoreValue);
+            else
+                _bus.Write32(effectiveAddress, rawStoreValue);
+        }
+
+        if (instruction.PreIndexing)
+        {
+            if (!instruction.WriteBack) return pcWasWritten;
+            _registers[instruction.BaseRegister] = effectiveAddress;
+        }
+        else // post-indexed => write back is compulsory
+        {
+            var updatedBase = instruction.AddOffset
+                ? baseValue + offsetValue
+                : baseValue - offsetValue;
+
+            _registers[instruction.BaseRegister] = updatedBase;
+        }
+
+        pcWasWritten |= instruction.BaseRegister == PcIndex;
+
+        return pcWasWritten;
     }
     
     private bool ConditionMet(ConditionCode condition)

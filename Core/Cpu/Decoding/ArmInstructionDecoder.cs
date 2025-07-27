@@ -8,6 +8,10 @@ public static class ArmInstructionDecoder
     private const uint DataProcessingTag  = 0x0000_0000u; // Data-processing tag
     private const uint MultiplyMask = 0x0FC0_00F0u;
     private const uint MultiplyTag = 0x0000_0090u;
+    private const uint BranchMask = 0x0E00_0000u;
+    private const uint BranchTag = 0x0A00_0000u;
+    private const uint SingleDataTransferMask = 0x0C00_0000u;
+    private const uint SingleDataTransferTag = 0x0400_0000u;
 
     /// <summary>
     /// attempts to parse <paramref name="rawInstruction"/> as a data-processing opcode.
@@ -64,6 +68,49 @@ public static class ArmInstructionDecoder
         return true;
 
     }
+
+    public static bool TryDecodeBranch(uint rawInstruction, out DecodedBranchInstruction decoded)
+    {
+        if ((rawInstruction & BranchMask) != BranchTag)
+        {
+            decoded = default;
+            return false;
+        }
+
+        var linkBitSet = (rawInstruction & (1u << 24)) != 0;
+
+        var imm24 = rawInstruction & 0x00FF_FFFFu;
+        var signedOffset = (int)(imm24 << 8) >> 6;
+        
+        decoded = new DecodedBranchInstruction(linkBitSet, signedOffset);
+        return true;
+    }
+
+    public static bool TryDecodeSingleDataTransfer(uint rawInstruction,
+        out DecodedSingleDataTransferInstruction decoded)
+    {
+        if ((rawInstruction & SingleDataTransferMask) != SingleDataTransferTag)
+        {
+            decoded = default;
+            return false;
+        }
+
+        var usesRegisterOffset = (rawInstruction & (1u << 25)) != 0;
+        var preIndexing = (rawInstruction & (1u << 24)) != 0;
+        var addOffset = (rawInstruction & (1u << 23)) != 0;
+        var byteTransfer = (rawInstruction & (1u << 22)) != 0;
+        var writeBack = (rawInstruction & (1u << 21)) != 0;
+        var load = (rawInstruction & (1u << 20)) != 0;
+        
+        var baseRegister = (int)((rawInstruction >> 16) & 0xF);
+        var sourceDestinationRegister  = (int)((rawInstruction >> 12) & 0xF);
+        var offsetField = rawInstruction & 0xFFFu;
+
+        decoded = new DecodedSingleDataTransferInstruction(load, byteTransfer, preIndexing, addOffset, writeBack,
+            usesRegisterOffset, baseRegister, sourceDestinationRegister, offsetField);
+        return true;
+    }
+    
     public static uint ExpandOperand2(
         DecodedDataProcessingInstruction instruction,
         ReadOnlySpan<uint> registers,
