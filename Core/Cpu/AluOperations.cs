@@ -2,14 +2,19 @@ namespace Core.Cpu;
 
 internal static class AluOperations
 {
+    internal static void UpdateNegativeZero(ref ProgramStatusRegister programStatusRegister, uint result)
+    {
+        programStatusRegister.Negative = (result & (1u << 31)) != 0;
+        programStatusRegister.Zero = result == 0;
+    }
+    
     internal static void UpdateNegativeZeroCarryOverflow(
         ref ProgramStatusRegister programStatusRegister,
         uint result,
         bool carry,
         bool overflow)
     {
-        programStatusRegister.Negative = (result & (1u << 31)) != 0;
-        programStatusRegister.Zero     = result == 0;
+        UpdateNegativeZero(ref programStatusRegister, result);
         programStatusRegister.Carry    = carry;
         programStatusRegister.Overflow = overflow;
     }

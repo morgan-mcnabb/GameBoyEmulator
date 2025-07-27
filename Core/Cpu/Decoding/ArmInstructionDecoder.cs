@@ -6,6 +6,8 @@ public static class ArmInstructionDecoder
 {
     private const uint DataProcessingMask = 0x0C00_0000u; // Bits 27-26
     private const uint DataProcessingTag  = 0x0000_0000u; // Data-processing tag
+    private const uint MultiplyMask = 0x0FC0_00F0u;
+    private const uint MultiplyTag = 0x0000_0090u;
 
     /// <summary>
     /// attempts to parse <paramref name="rawInstruction"/> as a data-processing opcode.
@@ -39,6 +41,29 @@ public static class ArmInstructionDecoder
         return true;
     }
 
+    public static bool TryDecodeMultiply(
+        uint rawInstruction,
+        out DecodedMultiplyInstruction decoded)
+    {
+        if ((rawInstruction & MultiplyMask) != MultiplyTag)
+        {
+            decoded = default;
+            return false;
+        }
+
+        var accumulate = (rawInstruction & (1u << 21)) != 0;
+        var setConditionCodes = (rawInstruction & (1u << 20)) != 0;
+        var destination = (int)((rawInstruction >> 16) & 0xF);
+        var accumulateRegister = (int)((rawInstruction >> 12) & 0xF);
+        var operandS = (int)((rawInstruction >> 8) & 0xF);
+        var operandM = (int)(rawInstruction & 0xF);
+        
+        decoded = new DecodedMultiplyInstruction(
+            accumulate, setConditionCodes, destination, accumulateRegister, operandM, operandS);
+
+        return true;
+
+    }
     public static uint ExpandOperand2(
         DecodedDataProcessingInstruction instruction,
         ReadOnlySpan<uint> registers,

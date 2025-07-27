@@ -54,12 +54,17 @@ public sealed class Arm7TdmiCpu : ICpu
         var pcWasWritten = false;
         // decode 
         // TODO: insert decode table & execution pipeline
-        if (ArmInstructionDecoder.TryDecodeDataProcessing(opcode, out var decodedInstruction))
+        if (ArmInstructionDecoder.TryDecodeMultiply(opcode, out var multiplyInstruction))
+            pcWasWritten = ExecuteMultiple(multiplyInstruction);
+        else if (ArmInstructionDecoder.TryDecodeDataProcessing(opcode, out var decodedInstruction))
             pcWasWritten = ExecuteDataProcessing(decodedInstruction);
         else
             throw new NotImplementedException(
                 $"Opcode group not yet implemented (0x{opcode:X8})");
 
+        if (pcWasWritten)
+            return;
+        
         AdvancePc();
     }
 
@@ -177,6 +182,28 @@ public sealed class Arm7TdmiCpu : ICpu
 
         if (updateCondition)
             AluOperations.UpdateNegativeZeroCarryOverflow(ref _currentProgramStatusRegister, result, carryOut, overflowOut );
+
+        return pcWritten;
+    }
+
+    private bool ExecuteMultiple(DecodedMultiplyInstruction instruction)
+    {
+        var multiplicand = _registers[instruction.OperandMRegister];
+        var multiplier = _registers[instruction.OperandSRegister];
+        var product64 = (ulong)multiplicand * multiplier; // 64-bit to avoid overflow loss
+        var result = (uint)product64;
+
+        if (instruction.Accumulate)
+        {
+            var addend = _registers[instruction.AccumulateRegister];
+            result = unchecked(result + addend); // wraparound, disable overflow checking
+        }
+
+        _registers[instruction.DestinationRegister] = result;
+        var pcWritten = instruction.DestinationRegister == PcIndex;
+
+        if (instruction.SetConditionCodes)
+            AluOperations.UpdateNegativeZero(ref _currentProgramStatusRegister, result);
 
         return pcWritten;
     }
